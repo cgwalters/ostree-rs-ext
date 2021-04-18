@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use fn_error_context::context;
 use indoc::indoc;
+use ostree_ext::container::{ImageReference, Transport};
 use sh_inline::bash;
 use std::io::Write;
 
@@ -11,6 +12,7 @@ const TESTREF: &str = "exampleos/x86_64/stable";
 const EXAMPLEOS_CONTENT_CHECKSUM: &str =
     "0ef7461f9db15e1d8bd8921abf20694225fbaa4462cadf7deed8ea0e43162120";
 
+#[context("Generating test repo")]
 fn generate_test_repo(dir: &Utf8Path) -> Result<Utf8PathBuf> {
     let src_tarpath = &dir.join("exampleos.tar.zst");
     std::fs::write(src_tarpath, EXAMPLEOS_V0)?;
@@ -95,6 +97,43 @@ fn test_tar_import_export() -> Result<()> {
         destrepodir = destrepodir.as_str(),
         imported_commit = imported_commit.as_str()
     )?;
+    Ok(())
+}
+
+#[test]
+fn test_container_import_export() -> Result<()> {
+    let cancellable = gio::NONE_CANCELLABLE;
+
+    let tempdir = tempfile::tempdir_in("/var/tmp")?;
+    let path = Utf8Path::from_path(tempdir.path()).unwrap();
+    let srcdir = &path.join("src");
+    std::fs::create_dir(srcdir)?;
+    let destdir = &path.join("dest");
+    std::fs::create_dir(destdir)?;
+    let srcrepopath = &generate_test_repo(srcdir)?;
+    let srcrepo = &ostree::Repo::new_for_path(srcrepopath);
+    srcrepo.open(cancellable)?;
+    let testrev = srcrepo
+        .resolve_rev(TESTREF, false)
+        .context("Failed to resolve ref")?
+        .unwrap();
+    let destrepo = &ostree::Repo::new_for_path(destdir);
+    destrepo.create(ostree::RepoMode::BareUser, cancellable)?;
+
+    let srcoci_path = &srcdir.join("oci");
+    let srcoci = ImageReference {
+        transport: Transport::OciDir,
+        name: srcoci_path.as_str().to_string(),
+    };
+    ostree_ext::container::export(srcrepo, TESTREF, &srcoci).context("exporting")?;
+
+    assert!(srcoci_path.exists());
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let import = rt
+        .block_on(async move { ostree_ext::container::import(destrepo, &srcoci).await })
+        .context("importing")?;
+    assert_eq!(import.ostree_commit, testrev.as_str());
     Ok(())
 }
 

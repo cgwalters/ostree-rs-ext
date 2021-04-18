@@ -75,7 +75,7 @@ fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<GzDecoder<BufReader<File>>> {
         .find(|layer| {
             matches!(
                 layer.media_type.as_str(),
-                myoci::DOCKER_TYPE_LAYER | oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE
+                myoci::DOCKER_TYPE_LAYER | myoci::IMAGE_LAYER_GZIP_MEDIA_TYPE
             )
         })
         .ok_or_else(|| anyhow!("Failed to find rootfs layer"))?;

@@ -16,10 +16,11 @@ static MACHINE_TO_OCI: phf::Map<&str, &str> = phf_map! {
 };
 
 // OCI types, see https://github.com/opencontainers/image-spec/blob/master/media-types.md
-const OCI_TYPE_CONFIG_JSON: &str = "application/vnd.oci.image.config.v1+json";
-const OCI_TYPE_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
-const OCI_TYPE_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
-
+pub(crate) const OCI_TYPE_CONFIG_JSON: &str = "application/vnd.oci.image.config.v1+json";
+pub(crate) const OCI_TYPE_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(crate) const OCI_TYPE_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+#[allow(dead_code)]
+pub(crate) const IMAGE_LAYER_GZIP_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 pub(crate) const DOCKER_TYPE_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
 /// Path inside an OCI directory to the blobs
@@ -28,7 +29,6 @@ const BLOBDIR: &str = "blobs/sha256";
 fn default_schema_version() -> u32 {
     2
 }
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IndexPlatform {
