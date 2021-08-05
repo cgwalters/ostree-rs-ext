@@ -5,13 +5,13 @@
 //! also exported as a library too, so that projects
 //! such as `rpm-ostree` can directly reuse it.
 
+use crate::container::Config;
 use anyhow::Result;
+use ostree::gio;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::ffi::OsString;
 use structopt::StructOpt;
-
-use crate::container::Config;
 
 #[derive(Debug, StructOpt)]
 struct BuildOpts {

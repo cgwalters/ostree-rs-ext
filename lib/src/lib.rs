@@ -9,6 +9,12 @@
 #![forbid(unused_must_use)]
 #![deny(unsafe_code)]
 
+// Re-exports of our dependencies.
+pub use ostree;
+pub use ostree::gio;
+// And chain from gio to glib
+pub use gio::glib;
+
 /// Our generic catchall fatal error, expected to be converted
 /// to a string to output to a terminal or logs.
 type Result<T> = anyhow::Result<T>;
@@ -21,3 +27,12 @@ pub mod ima;
 pub mod tar;
 #[allow(unsafe_code)]
 pub mod variant_utils;
+
+/// Intended for glob imports.
+pub mod prelude {
+    pub use super::gio;
+    pub use super::glib;
+    pub use super::ostree;
+    pub use gio::prelude::*;
+    pub use ostree::prelude::*;
+}
