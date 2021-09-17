@@ -32,7 +32,7 @@ use super::*;
 use anyhow::{anyhow, Context};
 use camino::Utf8Path;
 use fn_error_context::context;
-use futures_util::{Future, FutureExt, Stream, TryFutureExt};
+use futures_util::{Future, FutureExt, Stream, StreamExt, TryFutureExt};
 use std::io::prelude::*;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -117,8 +117,8 @@ pub async fn find_layer_tars(
     src: impl AsyncRead + Send + Unpin + 'static,
     blobids: &[&str],
 ) -> Result<(
-    impl AsyncRead,
-    impl Future<Output = Result<impl Stream<Item = impl Read + Send + Unpin + 'static>>>,
+    impl Stream<Item = impl AsyncRead + Send + Unpin + 'static>,
+    impl Future<Output = Result<impl Read + Send + Unpin + 'static>>,
 )> {
     // Convert the async input stream to synchronous, becuase we currently use the
     // sync tar crate.
@@ -127,18 +127,18 @@ pub async fn find_layer_tars(
     let (tx_buf, rx_buf) = tokio::sync::mpsc::channel(2);
     // Clone to appease borrow checker
     let blobids: Vec<String> = blobids.iter().map(|s| s.to_string()).collect();
-    let import = tokio::task::spawn_blocking(move || find_layer_tar_sync(pipein, &blobids, tx_buf))
+    let import = tokio::task::spawn_blocking(move || find_layer_tar_sync(pipein, blobids, tx_buf))
         .map_err(anyhow::Error::msg);
     // Bridge the channel to an AsyncRead
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx_buf);
-    let reader = tokio_util::io::StreamReader::new(stream);
+    let stream = stream.map(|r| tokio_util::io::StreamReader::new(r));
     // This async task owns the internal worker thread, which also owns the provided
     // input stream which we return to the caller.
     let worker = async move {
         let src_as_sync = import.await?.context("Import worker")?;
         Ok::<_, anyhow::Error>(src_as_sync)
     };
-    Ok((reader, worker))
+    Ok((stream, worker))
 }
 
 // Helper function invoked to synchronously parse a `docker-archive:` formatted tar stream, finding
@@ -146,19 +146,19 @@ pub async fn find_layer_tars(
 // to a channel.
 fn find_layer_tar_sync(
     pipein: impl Read + Send + Unpin,
-    blobids: &[&String],
+    blobids: Vec<String>,
     tx_buf: tokio::sync::mpsc::Sender<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>,
 ) -> Result<impl Read + Send + Unpin> {
     let mut archive = tar::Archive::new(pipein);
     let mut buf = vec![0u8; 8192];
-    let ents = archive.entries()?;
-    for &blobid in blobids {
+    let mut ents = archive.entries()?.into_iter();
+    for blobid in blobids {
         let digest = blobid
             .strip_prefix("sha256:")
-            .ok_or_else(|| format!("Invalid blobid: {}", blobid))?;
+            .ok_or_else(|| anyhow!("Invalid blobid: {}", blobid))?;
         let blob_target = format!("../{}", digest);
         let mut found = false;
-        for entry in ents {
+        while let Some(entry) = ents.next() {
             let mut entry = entry.context("Reading entry")?;
             let path = entry.path()?;
             let path: &Utf8Path = path.deref().try_into()?;
@@ -208,7 +208,7 @@ fn find_layer_tar_sync(
             }
         }
         if !found {
-            return Err(anyhow!("Failed to find layer {}", blobid))
+            return Err(anyhow!("Failed to find layer {}", blobid));
         }
     }
     Ok(archive.into_inner())
@@ -338,20 +338,36 @@ pub async fn import_from_manifest(
     let options = options.unwrap_or_default();
     let manifest: oci::Manifest = serde_json::from_slice(manifest_bytes)?;
     let layerids = find_layer_blobids(&manifest)?;
-    event!(Level::DEBUG, "target blobs: {:?}", layerids);
-    let (blob, worker) = fetch_layers(imgref, &layerids, options.progress).await?;
-    let blob = tokio::io::BufReader::new(blob);
-    let mut taropts: crate::tar::TarImportOptions = Default::default();
-    match &imgref.sigverify {
-        SignatureSource::OstreeRemote(remote) => taropts.remote = Some(remote.clone()),
-        SignatureSource::ContainerPolicy | SignatureSource::ContainerPolicyAllowInsecure => {}
+    if layerids.len() == 0 {
+        return Err(anyhow!("No layers found in image"));
     }
-    let import = crate::tar::import_tar(repo, blob, Some(taropts));
-    let (ostree_commit, worker) = tokio::join!(import, worker);
-    // Let any errors from skopeo take precedence, because a failure to parse/find the layer tarball
-    // is likely due to an underlying error from that.
-    let _: () = worker?;
-    let ostree_commit = ostree_commit?;
+    let target_layer_index = layerids.len().checked_sub(1).unwrap();
+    event!(Level::DEBUG, "target blobs: {:?}", layerids);
+    let (blobs, worker) = fetch_layers(imgref, &layerids, options.progress).await?;
+    let mut n = 0usize;
+    let mut imports = Vec::new();
+    while let Some(blob) = blobs.next().await {
+        let at_target = target_layer_index == n;
+        let blob = tokio::io::BufReader::new(blob);
+        let mut taropts: crate::tar::TarImportOptions = Default::default();
+        // We only verify the final layer's signature.
+        if at_target {
+            match &imgref.sigverify {
+                SignatureSource::OstreeRemote(remote) => taropts.remote = Some(remote.clone()),
+                SignatureSource::ContainerPolicy
+                | SignatureSource::ContainerPolicyAllowInsecure => {}
+            }
+        }
+        // Note that we explicitly don't `await?` i.e. check for errors here, because
+        // if the skopeo process errored out, we want that to take precedence.
+        imports.push(crate::tar::import_tar(repo, blob, Some(taropts)).await);
+    }
+    // Explicitly check if skopeo errored out - if so, any error from our tar import
+    // is likely caused by that, so show the user the real error.
+    let _: () = worker.await?;
+    let ostree_commit = imports
+        .pop()
+        .ok_or_else(|| anyhow!("Failed to find a layer"))??;
     event!(Level::DEBUG, "created commit {}", ostree_commit);
     Ok(ostree_commit)
 }
