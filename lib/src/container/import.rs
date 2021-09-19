@@ -127,11 +127,13 @@ pub async fn find_layer_tars(
     let (tx_buf, rx_buf) = tokio::sync::mpsc::channel(2);
     // Clone to appease borrow checker
     let blobids: Vec<String> = blobids.iter().map(|s| s.to_string()).collect();
-    let import = tokio::task::spawn_blocking(move || find_layer_tar_sync(pipein, blobids, tx_buf))
-        .map_err(anyhow::Error::msg);
+    let import =
+        tokio::task::spawn_blocking(move || find_layer_tar_streams_sync(pipein, blobids, tx_buf))
+            .map_err(anyhow::Error::msg);
     // Bridge the channel to an AsyncRead
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx_buf);
-    let stream = stream.map(|r| tokio_util::io::StreamReader::new(r));
+    let stream = stream
+        .map(|r| tokio_util::io::StreamReader::new(tokio_stream::wrappers::ReceiverStream::new(r)));
     // This async task owns the internal worker thread, which also owns the provided
     // input stream which we return to the caller.
     let worker = async move {
@@ -144,24 +146,24 @@ pub async fn find_layer_tars(
 // Helper function invoked to synchronously parse a `docker-archive:` formatted tar stream, finding
 // the desired layer tarballs and writing its contents via a stream of byte chunks
 // to a channel.
-fn find_layer_tar_sync(
+fn find_layer_tar_streams_sync(
     pipein: impl Read + Send + Unpin,
     blobids: Vec<String>,
     tx_buf: tokio::sync::mpsc::Sender<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>,
 ) -> Result<impl Read + Send + Unpin> {
     let mut archive = tar::Archive::new(pipein);
     let mut buf = vec![0u8; 8192];
-    let mut ents = archive.entries()?.into_iter();
-    for blobid in blobids {
-        let digest = blobid
-            .strip_prefix("sha256:")
-            .ok_or_else(|| anyhow!("Invalid blobid: {}", blobid))?;
-        let blob_target = format!("../{}", digest);
+    let mut ents = archive.entries()?;
+    dbg!(&blobids);
+    'outer: for blobid in blobids {
+        let blob_target = format!("../{}", blobid);
+        dbg!(&blob_target);
         let mut found = false;
         while let Some(entry) = ents.next() {
             let mut entry = entry.context("Reading entry")?;
             let path = entry.path()?;
             let path: &Utf8Path = path.deref().try_into()?;
+            dbg!(path);
             // We generally expect our layer to be first, but let's just skip anything
             // unexpected to be robust against changes in skopeo.
             if path.extension() != Some("tar") {
@@ -178,7 +180,9 @@ fn find_layer_tar_sync(
                                 .ok_or_else(|| anyhow!("Invalid link {}", path))?;
                             let target = Utf8Path::from_path(&*target)
                                 .ok_or_else(|| anyhow!("Invalid non-UTF8 path {:?}", target))?;
+                            dbg!(target);
                             if target != blob_target {
+                                continue;
                                 return Err(anyhow!(
                                     "Found unexpected layer link {} -> {}",
                                     path,
@@ -189,8 +193,13 @@ fn find_layer_tar_sync(
                     }
                 }
                 tar::EntryType::Regular => {
+                    found = true;
                     let (tx_child, rx_child) = tokio::sync::mpsc::channel(2);
-                    tx_buf.send(rx_child);
+                    // If the receiver closed the pipe, we're done.
+                    if tx_buf.blocking_send(rx_child).is_err() {
+                        dbg!("receiver closed");
+                        break 'outer;
+                    }
                     loop {
                         let n = entry
                             .read(&mut buf[..])
@@ -198,8 +207,11 @@ fn find_layer_tar_sync(
                         let done = 0 == n;
                         let r = Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[0..n]));
                         let receiver_closed = tx_child.blocking_send(r).is_err();
-                        if receiver_closed || done {
-                            found = true;
+                        if receiver_closed {
+                            dbg!(receiver_closed);
+                            break 'outer;
+                        }
+                        if done {
                             break;
                         }
                     }
@@ -210,6 +222,9 @@ fn find_layer_tar_sync(
         if !found {
             return Err(anyhow!("Failed to find layer {}", blobid));
         }
+    }
+    // Read all remaining entries
+    while let Some(_entry) = ents.next() {
     }
     Ok(archive.into_inner())
 }
@@ -278,7 +293,7 @@ fn find_layer_blobids(manifest: &oci::Manifest) -> Result<Vec<&str>> {
     manifest
         .layers
         .iter()
-        .filter_map(|&layer| -> Option<Result<&str>> {
+        .filter_map(|layer| -> Option<Result<&str>> {
             if matches!(
                 layer.media_type.as_str(),
                 super::oci::DOCKER_TYPE_LAYER | oci::OCI_TYPE_LAYER
@@ -286,8 +301,9 @@ fn find_layer_blobids(manifest: &oci::Manifest) -> Result<Vec<&str>> {
                 Some(
                     layer
                         .digest
+                        .as_str()
                         .strip_prefix("sha256:")
-                        .ok_or_else(|| anyhow!("Expected sha256: in digest: {}", layer.digest)),
+                        .ok_or_else(|| anyhow!("Expected sha256: in digest: {}", &layer.digest)),
                 )
             } else {
                 None
@@ -343,11 +359,14 @@ pub async fn import_from_manifest(
     }
     let target_layer_index = layerids.len().checked_sub(1).unwrap();
     event!(Level::DEBUG, "target blobs: {:?}", layerids);
-    let (blobs, worker) = fetch_layers(imgref, &layerids, options.progress).await?;
+    let (mut blobs, worker) = fetch_layers(imgref, &layerids, options.progress).await?;
     let mut n = 0usize;
     let mut imports = Vec::new();
+    let mut processed_final_layer = false;
     while let Some(blob) = blobs.next().await {
         let at_target = target_layer_index == n;
+        dbg!(n, target_layer_index);
+        n += 1;
         let blob = tokio::io::BufReader::new(blob);
         let mut taropts: crate::tar::TarImportOptions = Default::default();
         // We only verify the final layer's signature.
@@ -357,17 +376,23 @@ pub async fn import_from_manifest(
                 SignatureSource::ContainerPolicy
                 | SignatureSource::ContainerPolicyAllowInsecure => {}
             }
+            processed_final_layer = true;
         }
         // Note that we explicitly don't `await?` i.e. check for errors here, because
         // if the skopeo process errored out, we want that to take precedence.
         imports.push(crate::tar::import_tar(repo, blob, Some(taropts)).await);
     }
+    // Sanity check our math - we must have verified a final layer
+    // assert!(processed_final_layer);
     // Explicitly check if skopeo errored out - if so, any error from our tar import
     // is likely caused by that, so show the user the real error.
     let _: () = worker.await?;
-    let ostree_commit = imports
-        .pop()
-        .ok_or_else(|| anyhow!("Failed to find a layer"))??;
+    // Safety: We must have processed at least one layer
+    let ostree_commit = imports.pop().unwrap()?;
+    for (i, v) in imports.into_iter().enumerate() {
+        // Check the rest of the results
+        let _ = v.with_context(|| format!("Layer {}", i))?;
+    }
     event!(Level::DEBUG, "created commit {}", ostree_commit);
     Ok(ostree_commit)
 }
