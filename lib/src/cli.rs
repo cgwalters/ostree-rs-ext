@@ -6,6 +6,7 @@
 //! such as `rpm-ostree` can directly reuse it.
 
 use anyhow::Result;
+use camino::Utf8PathBuf;
 use futures_util::FutureExt;
 use ostree::{cap_std, gio, glib};
 use std::borrow::Borrow;
@@ -17,9 +18,10 @@ use structopt::StructOpt;
 use tokio_stream::StreamExt;
 
 use crate::commit::container_commit;
-use crate::container::store::{LayeredImageImporter, PrepareResult};
-use crate::container::{self as ostree_container, UnencapsulationProgress};
+use crate::container as ostree_container;
 use crate::container::{Config, ImageReference, OstreeImageReference, UnencapsulateOptions};
+use ostree_container::store::{ImageImporter, PrepareResult};
+use ostree_container::UnencapsulationProgress;
 
 /// Parse an [`OstreeImageReference`] from a CLI arguemnt.
 pub fn parse_imgref(s: &str) -> Result<OstreeImageReference> {
@@ -257,11 +259,19 @@ struct ImaSignOpts {
 /// Options for internal testing
 #[derive(Debug, StructOpt)]
 enum TestingOpts {
-    // Detect the current environment
+    /// Detect the current environment
     DetectEnv,
     /// Execute integration tests, assuming mutable environment
     Run,
     FilterTar,
+    /// Append a directory to an OCI image (oci directory)
+    OciExtend {
+        /// The oci directory
+        ocidir: Utf8PathBuf,
+
+        /// Directory containing files to add as a new layer
+        contentdir: Utf8PathBuf,
+    },
 }
 
 /// Toplevel options for extended ostree functionality.
@@ -413,7 +423,8 @@ async fn container_export(
         copy_meta_keys,
         ..Default::default()
     };
-    let pushed = crate::container::encapsulate(repo, rev, &config, Some(opts), imgref).await?;
+    let pushed =
+        crate::container::encapsulate(repo, rev, &config, Some(opts), None, imgref).await?;
     println!("{}", pushed);
     Ok(())
 }
@@ -431,7 +442,7 @@ async fn container_store(
     imgref: &OstreeImageReference,
     proxyopts: ContainerProxyOpts,
 ) -> Result<()> {
-    let mut imp = LayeredImageImporter::new(repo, imgref, proxyopts.into()).await?;
+    let mut imp = ImageImporter::new(repo, imgref, proxyopts.into()).await?;
     let prep = match imp.prepare().await? {
         PrepareResult::AlreadyPresent(c) => {
             println!("No changes in {} => {}", imgref, c.merge_commit);
@@ -439,17 +450,7 @@ async fn container_store(
         }
         PrepareResult::Ready(r) => r,
     };
-    if prep.base_layer.commit.is_none() {
-        let size = crate::glib::format_size(prep.base_layer.size());
-        println!(
-            "Downloading base layer: {} ({})",
-            prep.base_layer.digest(),
-            size
-        );
-    } else {
-        println!("Using base: {}", prep.base_layer.digest());
-    }
-    for layer in prep.layers.iter() {
+    for layer in prep.all_layers() {
         if layer.commit.is_some() {
             println!("Using layer: {}", layer.digest());
         } else {
@@ -503,6 +504,9 @@ fn testing(opts: &TestingOpts) -> Result<()> {
         TestingOpts::Run => crate::integrationtest::run_tests(),
         TestingOpts::FilterTar => {
             crate::tar::filter_tar(std::io::stdin(), std::io::stdout()).map(|_| {})
+        }
+        TestingOpts::OciExtend { ocidir, contentdir } => {
+            crate::integrationtest::generate_derived_oci(ocidir, contentdir)
         }
     }
 }
