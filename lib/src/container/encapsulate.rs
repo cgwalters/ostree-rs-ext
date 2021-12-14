@@ -3,6 +3,7 @@
 use super::ocidir::OciDir;
 use super::{ocidir, OstreeImageReference, Transport};
 use super::{ImageReference, SignatureSource, OSTREE_COMMIT_LABEL};
+use crate::chunking::Chunking;
 use crate::container::skopeo;
 use crate::tar as ostree_tar;
 use anyhow::{anyhow, Context, Result};
@@ -70,6 +71,46 @@ fn commit_meta_to_labels<'a>(
     Ok(())
 }
 
+/// Write an ostree commit to an OCI blob
+#[context("Writing ostree root to blob")]
+#[allow(clippy::too_many_arguments)]
+fn export_chunked(
+    repo: &ostree::Repo,
+    ociw: &mut OciDir,
+    manifest: &mut oci_image::ImageManifest,
+    imgcfg: &mut oci_image::ImageConfiguration,
+    labels: &mut HashMap<String, String>,
+    mut chunking: Chunking,
+    compression: Option<flate2::Compression>,
+    description: &str,
+) -> Result<()> {
+    let layers: Result<Vec<_>> = chunking
+        .take_chunks()
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| -> Result<_> {
+            let mut w = ociw.create_layer(compression)?;
+            ostree_tar::export_chunk(repo, &chunk, &mut w)
+                .with_context(|| format!("Exporting chunk {}", i))?;
+            let w = w.into_inner()?;
+            Ok((w.complete()?, chunk.name))
+        })
+        .collect();
+    for (layer, name) in layers? {
+        ociw.push_layer(manifest, imgcfg, layer, &name);
+    }
+    let mut w = ociw.create_layer(compression)?;
+    ostree_tar::export_final_chunk(repo, &chunking, &mut w)?;
+    let w = w.into_inner()?;
+    let final_layer = w.complete()?;
+    labels.insert(
+        crate::container::OSTREE_LAYER_LABEL.into(),
+        format!("sha256:{}", final_layer.blob.sha256),
+    );
+    ociw.push_layer(manifest, imgcfg, final_layer, description);
+    Ok(())
+}
+
 /// Generate an OCI image from a given ostree root
 #[context("Building oci")]
 fn build_oci(
@@ -109,18 +150,67 @@ fn build_oci(
 
     let mut manifest = ocidir::new_empty_manifest().build().unwrap();
 
+    let chunking = if opts.chunked {
+        // compression = Some(flate2::Compression::none());
+        let mut c = crate::chunking::Chunking::new(repo, commit)?;
+        c.auto_chunk(repo)?;
+        Some(c)
+    } else {
+        None
+    };
+
     if let Some(version) =
         commit_meta.lookup_value("version", Some(glib::VariantTy::new("s").unwrap()))
     {
         let version = version.str().unwrap();
         labels.insert("version".into(), version.into());
     }
-
     labels.insert(OSTREE_COMMIT_LABEL.into(), commit.into());
 
     for (k, v) in config.labels.iter().flat_map(|k| k.iter()) {
         labels.insert(k.into(), v.into());
     }
+
+    let compression = if opts.compress {
+        flate2::Compression::default()
+    } else {
+        flate2::Compression::none()
+    };
+
+    let mut annos = HashMap::new();
+    annos.insert(BLOB_OSTREE_ANNOTATION.to_string(), "true".to_string());
+    let description = if commit_subject.is_empty() {
+        Cow::Owned(format!("ostree export of commit {}", commit))
+    } else {
+        Cow::Borrowed(commit_subject)
+    };
+
+    if let Some(chunking) = chunking {
+        export_chunked(
+            repo,
+            &mut writer,
+            &mut manifest,
+            &mut imgcfg,
+            labels,
+            chunking,
+            Some(compression),
+            &description,
+        )?;
+    } else {
+        let rootfs_blob = export_ostree_ref(repo, commit, &mut writer, Some(compression))?;
+        labels.insert(
+            crate::container::OSTREE_LAYER_LABEL.into(),
+            format!("sha256:{}", rootfs_blob.blob.sha256),
+        );
+        writer.push_layer_annotated(
+            &mut manifest,
+            &mut imgcfg,
+            rootfs_blob,
+            Some(annos),
+            &description,
+        );
+    }
+
     // Lookup the cmd embedded in commit metadata
     let cmd = commit_meta.lookup::<Vec<String>>(ostree::COMMIT_META_CONTAINER_CMD)?;
     // But support it being overridden by CLI options
@@ -130,28 +220,6 @@ fn build_oci(
     }
 
     imgcfg.set_config(Some(ctrcfg));
-
-    let compression = if opts.compress {
-        flate2::Compression::default()
-    } else {
-        flate2::Compression::none()
-    };
-
-    let rootfs_blob = export_ostree_ref(repo, commit, &mut writer, Some(compression))?;
-    let description = if commit_subject.is_empty() {
-        Cow::Owned(format!("ostree export of commit {}", commit))
-    } else {
-        Cow::Borrowed(commit_subject)
-    };
-    let mut annos = HashMap::new();
-    annos.insert(BLOB_OSTREE_ANNOTATION.to_string(), "true".to_string());
-    writer.push_layer_annotated(
-        &mut manifest,
-        &mut imgcfg,
-        rootfs_blob,
-        Some(annos),
-        &description,
-    );
     let ctrcfg = writer.write_config(imgcfg)?;
     manifest.set_config(ctrcfg);
     writer.write_manifest(manifest, oci_image::Platform::default())?;
@@ -227,6 +295,8 @@ pub struct ExportOpts {
     pub compress: bool,
     /// A set of commit metadata keys to copy as image labels.
     pub copy_meta_keys: Vec<String>,
+    /// Whether or not to generate multiple layers
+    pub chunked: bool,
 }
 
 /// Given an OSTree repository and ref, generate a container image.

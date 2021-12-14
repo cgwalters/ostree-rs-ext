@@ -5,7 +5,7 @@ use camino::Utf8Path;
 use once_cell::sync::Lazy;
 use ostree_ext::container::store::PrepareResult;
 use ostree_ext::container::{
-    Config, ImageReference, OstreeImageReference, SignatureSource, Transport,
+    Config, ExportOpts, ImageReference, OstreeImageReference, SignatureSource, Transport,
 };
 use ostree_ext::tar::TarImportOptions;
 use ostree_ext::{gio, glib};
@@ -22,7 +22,7 @@ const TEST_REGISTRY_DEFAULT: &str = "localhost:5000";
 
 fn assert_err_contains<T>(r: Result<T>, s: impl AsRef<str>) {
     let s = s.as_ref();
-    let msg = format!("{:#}", r.err().unwrap());
+    let msg = format!("{:#}", r.err().expect("Expecting an error"));
     if !msg.contains(s) {
         panic!(r#"Error message "{}" did not contain "{}""#, msg, s);
     }
@@ -361,8 +361,7 @@ fn skopeo_inspect_config(imgref: &str) -> Result<oci_spec::image::ImageConfigura
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
-#[tokio::test]
-async fn test_container_import_export() -> Result<()> {
+async fn impl_test_container_import_export(chunked: bool) -> Result<()> {
     let fixture = Fixture::new()?;
     let testrev = fixture
         .srcrepo()
@@ -383,7 +382,8 @@ async fn test_container_import_export() -> Result<()> {
         ),
         ..Default::default()
     };
-    let opts = ostree_ext::container::ExportOpts {
+    let opts = ExportOpts {
+        chunked,
         copy_meta_keys: vec!["buildsys.checksum".to_string()],
         ..Default::default()
     };
@@ -492,6 +492,13 @@ async fn oci_clone(src: impl AsRef<Utf8Path>, dest: impl AsRef<Utf8Path>) -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn test_container_import_export() -> Result<()> {
+    impl_test_container_import_export(false).await?;
+    impl_test_container_import_export(true).await?;
+    Ok(())
+}
+
 /// But layers work via the container::write module.
 #[tokio::test]
 async fn test_container_write_derive() -> Result<()> {
@@ -548,28 +555,28 @@ async fn test_container_write_derive() -> Result<()> {
     let images = ostree_ext::container::store::list_images(fixture.destrepo())?;
     assert!(images.is_empty());
 
-    // Verify importing a derive dimage fails
+    // Verify importing a derived image fails
     let r = ostree_ext::container::unencapsulate(fixture.destrepo(), &derived_ref, None).await;
-    assert_err_contains(r, "Expected 1 layer, found 2");
+    assert_err_contains(r, "Image has 1 non-ostree layers");
 
     // Pull a derived image - two layers, new base plus one layer.
-    let mut imp = ostree_ext::container::store::LayeredImageImporter::new(
+    let mut imp = ostree_ext::container::store::ImageImporter::new(
         fixture.destrepo(),
         &derived_ref,
         Default::default(),
     )
     .await?;
-    let prep = match imp.prepare().await? {
+    let prep = match imp.prepare().await.context("Init prep derived")? {
         PrepareResult::AlreadyPresent(_) => panic!("should not be already imported"),
         PrepareResult::Ready(r) => r,
     };
     let expected_digest = prep.manifest_digest.clone();
-    assert!(prep.base_layer.commit.is_none());
+    assert!(prep.ostree_commit_layer.commit.is_none());
     assert_eq!(prep.layers.len(), 1);
     for layer in prep.layers.iter() {
         assert!(layer.commit.is_none());
     }
-    let import = imp.import(prep).await?;
+    let import = imp.import(prep).await.context("Init pull derived")?;
     // We should have exactly one image stored.
     let images = ostree_ext::container::store::list_images(fixture.destrepo())?;
     assert_eq!(images.len(), 1);
@@ -583,17 +590,13 @@ async fn test_container_write_derive() -> Result<()> {
     assert!(digest.starts_with("sha256:"));
     assert_eq!(digest, expected_digest);
 
-    #[cfg(feature = "proxy_v0_2_3")]
-    {
-        let commit_meta = &imported_commit.child_value(0);
-        let proxy = containers_image_proxy::ImageProxy::new().await?;
-        let commit_meta = glib::VariantDict::new(Some(commit_meta));
-        let config = commit_meta
-            .lookup::<String>("ostree.container.image-config")?
-            .unwrap();
-        let config: oci_spec::image::ImageConfiguration = serde_json::from_str(&config)?;
-        assert_eq!(config.os(), &oci_spec::image::Os::Linux);
-    }
+    let commit_meta = &imported_commit.child_value(0);
+    let commit_meta = glib::VariantDict::new(Some(commit_meta));
+    let config = commit_meta
+        .lookup::<String>("ostree.container.image-config")?
+        .unwrap();
+    let config: oci_spec::image::ImageConfiguration = serde_json::from_str(&config)?;
+    assert_eq!(config.os(), &oci_spec::image::Os::Linux);
 
     // Parse the commit and verify we pulled the derived content.
     bash_in!(
@@ -603,7 +606,7 @@ async fn test_container_write_derive() -> Result<()> {
     )?;
 
     // Import again, but there should be no changes.
-    let mut imp = ostree_ext::container::store::LayeredImageImporter::new(
+    let mut imp = ostree_ext::container::store::ImageImporter::new(
         fixture.destrepo(),
         &derived_ref,
         Default::default(),
@@ -620,7 +623,7 @@ async fn test_container_write_derive() -> Result<()> {
     // Test upgrades; replace the oci-archive with new content.
     std::fs::remove_dir_all(derived_path)?;
     std::fs::rename(derived2_path, derived_path)?;
-    let mut imp = ostree_ext::container::store::LayeredImageImporter::new(
+    let mut imp = ostree_ext::container::store::ImageImporter::new(
         fixture.destrepo(),
         &derived_ref,
         Default::default(),
@@ -631,7 +634,7 @@ async fn test_container_write_derive() -> Result<()> {
         PrepareResult::Ready(r) => r,
     };
     // We *should* already have the base layer.
-    assert!(prep.base_layer.commit.is_some());
+    assert!(prep.ostree_commit_layer.commit.is_some());
     // One new layer
     assert_eq!(prep.layers.len(), 1);
     for layer in prep.layers.iter() {
@@ -659,7 +662,7 @@ async fn test_container_write_derive() -> Result<()> {
     )?;
 
     // And there should be no changes on upgrade again.
-    let mut imp = ostree_ext::container::store::LayeredImageImporter::new(
+    let mut imp = ostree_ext::container::store::ImageImporter::new(
         fixture.destrepo(),
         &derived_ref,
         Default::default(),

@@ -6,6 +6,7 @@
 //! such as `rpm-ostree` can directly reuse it.
 
 use anyhow::Result;
+use camino::Utf8PathBuf;
 use futures_util::FutureExt;
 use ostree::{cap_std, gio, glib};
 use std::borrow::Borrow;
@@ -17,9 +18,10 @@ use structopt::StructOpt;
 use tokio_stream::StreamExt;
 
 use crate::commit::container_commit;
-use crate::container::store::{LayeredImageImporter, PrepareResult};
-use crate::container::{self as ostree_container, UnencapsulationProgress};
+use crate::container as ostree_container;
 use crate::container::{Config, ImageReference, OstreeImageReference, UnencapsulateOptions};
+use ostree_container::store::{ImageImporter, PrepareResult};
+use ostree_container::UnencapsulationProgress;
 
 fn parse_imgref(s: &str) -> Result<OstreeImageReference> {
     OstreeImageReference::try_from(s)
@@ -129,6 +131,10 @@ enum ContainerOpts {
         /// Corresponds to the Dockerfile `CMD` instruction.
         #[structopt(long)]
         cmd: Option<Vec<String>>,
+
+        #[structopt(long, hidden = true)]
+        /// Output in multiple blobs
+        ex_chunked: bool,
     },
 
     #[structopt(alias = "commit")]
@@ -254,11 +260,32 @@ struct ImaSignOpts {
 /// Options for internal testing
 #[derive(Debug, StructOpt)]
 enum TestingOpts {
-    // Detect the current environment
+    /// Detect the current environment
     DetectEnv,
     /// Execute integration tests, assuming mutable environment
     Run,
     FilterTar,
+    /// Append a directory to an OCI image (oci directory)
+    OciExtend {
+        /// The oci directory
+        ocidir: Utf8PathBuf,
+
+        /// Directory containing files to add as a new layer
+        contentdir: Utf8PathBuf,
+    },
+}
+
+/// Experimental options
+#[derive(Debug, StructOpt)]
+enum ExperimentalOpts {
+    /// Print chunking
+    PrintChunks {
+        /// Path to the repository
+        #[structopt(long)]
+        repo: String,
+        /// The ostree ref or commt
+        rev: String,
+    },
 }
 
 /// Toplevel options for extended ostree functionality.
@@ -276,6 +303,9 @@ enum Opt {
     #[structopt(setting(structopt::clap::AppSettings::Hidden))]
     #[cfg(feature = "internal-testing-api")]
     InternalOnlyForTesting(TestingOpts),
+    /// Experimental/debug CLI
+    #[structopt(setting(structopt::clap::AppSettings::Hidden))]
+    Experimental(ExperimentalOpts),
 }
 
 #[allow(clippy::from_over_into)]
@@ -401,6 +431,7 @@ async fn container_export(
     labels: BTreeMap<String, String>,
     copy_meta_keys: Vec<String>,
     cmd: Option<Vec<String>>,
+    chunked: bool,
 ) -> Result<()> {
     let config = Config {
         labels: Some(labels),
@@ -408,6 +439,7 @@ async fn container_export(
     };
     let opts = crate::container::ExportOpts {
         copy_meta_keys,
+        chunked,
         ..Default::default()
     };
     let pushed = crate::container::encapsulate(repo, rev, &config, Some(opts), imgref).await?;
@@ -428,7 +460,7 @@ async fn container_store(
     imgref: &OstreeImageReference,
     proxyopts: ContainerProxyOpts,
 ) -> Result<()> {
-    let mut imp = LayeredImageImporter::new(repo, imgref, proxyopts.into()).await?;
+    let mut imp = ImageImporter::new(repo, imgref, proxyopts.into()).await?;
     let prep = match imp.prepare().await? {
         PrepareResult::AlreadyPresent(c) => {
             println!("No changes in {} => {}", imgref, c.merge_commit);
@@ -436,17 +468,7 @@ async fn container_store(
         }
         PrepareResult::Ready(r) => r,
     };
-    if prep.base_layer.commit.is_none() {
-        let size = crate::glib::format_size(prep.base_layer.size());
-        println!(
-            "Downloading base layer: {} ({})",
-            prep.base_layer.digest(),
-            size
-        );
-    } else {
-        println!("Using base: {}", prep.base_layer.digest());
-    }
-    for layer in prep.layers.iter() {
+    for layer in prep.all_layers() {
         if layer.commit.is_some() {
             println!("Using layer: {}", layer.digest());
         } else {
@@ -501,6 +523,9 @@ fn testing(opts: &TestingOpts) -> Result<()> {
         TestingOpts::FilterTar => {
             crate::tar::filter_tar(std::io::stdin(), std::io::stdout()).map(|_| {})
         }
+        TestingOpts::OciExtend { ocidir, contentdir } => {
+            crate::integrationtest::generate_derived_oci(ocidir, contentdir)
+        }
     }
 }
 
@@ -531,6 +556,7 @@ where
                 labels,
                 copy_meta_keys,
                 cmd,
+                ex_chunked,
             } => {
                 let labels: Result<BTreeMap<_, _>> = labels
                     .into_iter()
@@ -541,7 +567,16 @@ where
                         Ok((k.to_string(), v.to_string()))
                     })
                     .collect();
-                container_export(&repo, &rev, &imgref, labels?, copy_meta_keys, cmd).await
+                container_export(
+                    &repo,
+                    &rev,
+                    &imgref,
+                    labels?,
+                    copy_meta_keys,
+                    cmd,
+                    ex_chunked,
+                )
+                .await
             }
             ContainerOpts::Image(opts) => match opts {
                 ContainerImageOpts::List { repo } => {
@@ -588,5 +623,14 @@ where
         Opt::ImaSign(ref opts) => ima_sign(opts),
         #[cfg(feature = "internal-testing-api")]
         Opt::InternalOnlyForTesting(ref opts) => testing(opts),
+        Opt::Experimental(ref opts) => match opts {
+            ExperimentalOpts::PrintChunks { repo, rev } => {
+                let repo = &ostree::Repo::open_at(libc::AT_FDCWD, repo, gio::NONE_CANCELLABLE)?;
+                let mut chunks = crate::chunking::Chunking::new(repo, rev)?;
+                chunks.auto_chunk(repo)?;
+                crate::chunking::print(&chunks);
+                Ok(())
+            }
+        },
     }
 }

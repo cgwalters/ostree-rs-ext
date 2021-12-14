@@ -36,8 +36,11 @@ pub mod refescape;
 pub mod tar;
 pub mod tokio_util;
 
+mod chunking;
 pub(crate) mod commit;
+pub mod objectsource;
 pub(crate) mod objgv;
+
 /// Prelude, intended for glob import.
 pub mod prelude {
     #[doc(hidden)]
