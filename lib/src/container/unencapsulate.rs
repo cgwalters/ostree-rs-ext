@@ -184,9 +184,12 @@ pub async fn unencapsulate(
     let oi = &proxy.open_image(&imgref.imgref.to_string()).await?;
     let (image_digest, raw_manifest) = proxy.fetch_manifest(oi).await?;
     let manifest = serde_json::from_slice(&raw_manifest)?;
-    let ostree_commit =
-        unencapsulate_from_manifest_impl(repo, &mut proxy, imgref, oi, &manifest, options, false)
-            .await?;
+    let config = proxy.fetch_config(oi).await?;
+    let config = serde_json::from_slice(&config)?;
+    let ostree_commit = unencapsulate_from_manifest_impl(
+        repo, &mut proxy, imgref, oi, &manifest, &config, options, false,
+    )
+    .await?;
     proxy.close_image(oi).await?;
     Ok(Import {
         ostree_commit,
@@ -232,6 +235,7 @@ pub(crate) async fn unencapsulate_from_manifest_impl(
     imgref: &OstreeImageReference,
     oi: &containers_image_proxy::OpenedImage,
     manifest: &oci_spec::image::ImageManifest,
+    _config: &oci_spec::image::ImageConfiguration,
     options: Option<UnencapsulateOptions>,
     ignore_layered: bool,
 ) -> Result<String> {
@@ -285,9 +289,12 @@ pub async fn unencapsulate_from_manifest(
 ) -> Result<String> {
     let mut proxy = ImageProxy::new().await?;
     let oi = &proxy.open_image(&imgref.imgref.to_string()).await?;
-    let r =
-        unencapsulate_from_manifest_impl(repo, &mut proxy, imgref, oi, manifest, options, false)
-            .await?;
+    let config = proxy.fetch_config(&oi).await?;
+    let config = serde_json::from_slice(&config)?;
+    let r = unencapsulate_from_manifest_impl(
+        repo, &mut proxy, imgref, oi, manifest, &config, options, false,
+    )
+    .await?;
     proxy.close_image(oi).await?;
     // FIXME write ostree commit after proxy finalization
     proxy.finalize().await?;
