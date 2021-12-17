@@ -221,6 +221,8 @@ pub use unencapsulate::*;
 mod ociwriter;
 mod skopeo;
 pub mod store;
+mod commit;
+pub use commit::*;
 
 #[cfg(test)]
 mod tests {

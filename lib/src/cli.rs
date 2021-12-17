@@ -124,6 +124,9 @@ enum ContainerOpts {
 
     /// Commands for working with (possibly layered, non-encapsulated) container images.
     Image(ContainerImageOpts),
+
+    /// Inside a container image, perform all final steps to generate an OSTree commit.
+    Commit,
 }
 
 /// Options for container image fetching.
@@ -542,6 +545,9 @@ where
                         .await
                 }
             },
+            ContainerOpts::Commit => {
+                crate::container::container_commit()
+            }
         },
         Opt::ImaSign(ref opts) => ima_sign(opts),
         Opt::InternalOnlyForTesting(ref opts) => testing(opts),
