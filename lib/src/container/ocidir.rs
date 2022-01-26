@@ -3,14 +3,18 @@
 
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
+use cap_std::fs::{Dir, DirBuilder, Permissions};
+use cap_std_ext::cap_std;
+use cap_std_ext::prelude::CapStdExtDirExt;
 use flate2::write::GzEncoder;
 use fn_error_context::context;
 use oci_image::MediaType;
 use oci_spec::image as oci_image;
-use openat_ext::*;
 use openssl::hash::{Hasher, MessageDigest};
 use std::collections::HashMap;
 use std::io::prelude::*;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::prelude::PermissionsExt;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -50,21 +54,21 @@ impl Layer {
 }
 
 /// Create an OCI blob.
-pub(crate) struct BlobWriter<'a> {
+pub(crate) struct BlobWriter<'p, 'd> {
     pub(crate) hash: Hasher,
-    pub(crate) target: Option<FileWriter<'a>>,
+    pub(crate) target: Option<cap_std_ext::tempfile::LinkableTempfile<'p, 'd>>,
     size: u64,
 }
 
 /// Create an OCI layer (also a blob).
-pub(crate) struct RawLayerWriter<'a> {
-    bw: BlobWriter<'a>,
+pub(crate) struct RawLayerWriter<'p, 'd> {
+    bw: BlobWriter<'p, 'd>,
     uncompressed_hash: Hasher,
     compressor: GzEncoder<Vec<u8>>,
 }
 
 pub(crate) struct OciDir {
-    pub(crate) dir: Rc<openat::Dir>,
+    pub(crate) dir: Rc<cap_std::fs::Dir>,
 }
 
 /// Write a serializable data (JSON) as an OCI blob
@@ -120,10 +124,13 @@ pub(crate) fn new_empty_manifest() -> oci_image::ImageManifestBuilder {
 
 impl OciDir {
     /// Create a new, empty OCI directory at the target path, which should be empty.
-    pub(crate) fn create(dir: impl Into<Rc<openat::Dir>>) -> Result<Self> {
-        let dir = dir.into();
-        dir.ensure_dir_all(BLOBDIR, 0o755)?;
-        dir.write_file_contents("oci-layout", 0o644, r#"{"imageLayoutVersion":"1.0.0"}"#)?;
+    pub(crate) fn create(dir: &Dir) -> Result<Self> {
+        dir.ensure_dir_with(BLOBDIR, DirBuilder::new().mode(0o755).recursive(true))?;
+        dir.replace_contents_with_perms(
+            "oci-layout",
+            r#"{"imageLayoutVersion":"1.0.0"}"#,
+            Permissions::from_mode(0o644),
+        )?;
         Self::open(dir)
     }
 
@@ -141,7 +148,7 @@ impl OciDir {
     }
 
     /// Open an existing OCI directory.
-    pub(crate) fn open(dir: impl Into<Rc<openat::Dir>>) -> Result<Self> {
+    pub(crate) fn open(dir: impl Into<Rc<Dir>>) -> Result<Self> {
         Ok(Self { dir: dir.into() })
     }
 
@@ -268,9 +275,9 @@ impl OciDir {
     }
 }
 
-impl<'a> BlobWriter<'a> {
+impl<'p, 'd> BlobWriter<'p, 'd> {
     #[context("Creating blob writer")]
-    fn new(ocidir: &'a openat::Dir) -> Result<Self> {
+    fn new(ocidir: &'d cap_std::fs::Dir) -> Result<Self> {
         Ok(Self {
             hash: Hasher::new(MessageDigest::sha256())?,
             // FIXME add ability to choose filename after completion
@@ -292,7 +299,7 @@ impl<'a> BlobWriter<'a> {
     }
 }
 
-impl<'a> std::io::Write for BlobWriter<'a> {
+impl<'p, 'd> std::io::Write for BlobWriter<'p, 'd> {
     fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
         self.hash.update(srcbuf)?;
         self.target.as_mut().unwrap().writer.write_all(srcbuf)?;
@@ -305,9 +312,9 @@ impl<'a> std::io::Write for BlobWriter<'a> {
     }
 }
 
-impl<'a> RawLayerWriter<'a> {
+impl<'p, 'd> RawLayerWriter<'p, 'd> {
     /// Create a writer for a gzip compressed layer blob.
-    fn new(ocidir: &'a openat::Dir, c: Option<flate2::Compression>) -> Result<Self> {
+    fn new(ocidir: &'p Dir, c: Option<flate2::Compression>) -> Result<Self> {
         let bw = BlobWriter::new(ocidir)?;
         Ok(Self {
             bw,
@@ -331,7 +338,7 @@ impl<'a> RawLayerWriter<'a> {
     }
 }
 
-impl<'a> std::io::Write for RawLayerWriter<'a> {
+impl<'p, 'd> std::io::Write for RawLayerWriter<'p, 'd> {
     fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
         self.compressor.get_mut().clear();
         self.compressor.write_all(srcbuf).unwrap();
