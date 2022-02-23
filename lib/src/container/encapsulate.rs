@@ -5,6 +5,7 @@ use super::{ocidir, OstreeImageReference, Transport};
 use super::{ImageReference, SignatureSource, OSTREE_COMMIT_LABEL};
 use crate::chunking::Chunking;
 use crate::container::skopeo;
+use crate::objectsource::ObjectMeta;
 use crate::tar as ostree_tar;
 use anyhow::{anyhow, Context, Result};
 use fn_error_context::context;
@@ -119,6 +120,7 @@ fn build_oci(
     ocidir_path: &Path,
     config: &Config,
     opts: ExportOpts,
+    contentmeta: Option<&ObjectMeta>,
 ) -> Result<ImageReference> {
     // Explicitly error if the target exists
     std::fs::create_dir(ocidir_path).context("Creating OCI dir")?;
@@ -150,7 +152,11 @@ fn build_oci(
 
     let mut manifest = ocidir::new_empty_manifest().build().unwrap();
 
-    let chunking = if opts.chunked {
+    let chunking = if let Some(contentmeta) = contentmeta {
+        let mut c = crate::chunking::Chunking::new(repo, commit)?;
+        c.process_mapping(contentmeta)?;
+        Some(c)
+    } else if opts.chunked {
         // compression = Some(flate2::Compression::none());
         let mut c = crate::chunking::Chunking::new(repo, commit)?;
         c.auto_chunk(repo)?;
@@ -237,6 +243,7 @@ async fn build_impl(
     ostree_ref: &str,
     config: &Config,
     opts: Option<ExportOpts>,
+    contentmeta: Option<&ObjectMeta>,
     dest: &ImageReference,
 ) -> Result<String> {
     let mut opts = opts.unwrap_or_default();
@@ -250,6 +257,7 @@ async fn build_impl(
             Path::new(dest.name.as_str()),
             config,
             opts,
+            contentmeta,
         )?;
         None
     } else {
@@ -258,7 +266,14 @@ async fn build_impl(
         let tempdest = tempdest.to_str().unwrap();
         let digestfile = tempdir.path().join("digestfile");
 
-        let src = build_oci(repo, ostree_ref, Path::new(tempdest), config, opts)?;
+        let src = build_oci(
+            repo,
+            ostree_ref,
+            Path::new(tempdest),
+            config,
+            opts,
+            contentmeta,
+        )?;
 
         let mut cmd = skopeo::new_cmd();
         tracing::event!(Level::DEBUG, "Copying {} to {}", src, dest);
@@ -307,7 +322,8 @@ pub async fn encapsulate<S: AsRef<str>>(
     ostree_ref: S,
     config: &Config,
     opts: Option<ExportOpts>,
+    contentmeta: Option<&ObjectMeta>,
     dest: &ImageReference,
 ) -> Result<String> {
-    build_impl(repo, ostree_ref.as_ref(), config, opts, dest).await
+    build_impl(repo, ostree_ref.as_ref(), config, opts, contentmeta, dest).await
 }

@@ -6,6 +6,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use crate::objectsource::ObjectMeta;
 use crate::objgv::*;
 use anyhow::Result;
 use camino::Utf8PathBuf;
@@ -74,6 +75,7 @@ impl Meta {
     }
 }
 
+/// How to split up an ostree commit into "chunks" - designed to map to container image layers.
 #[derive(Debug, Default)]
 pub(crate) struct Chunking {
     pub(crate) metadata_size: u64,
@@ -326,7 +328,12 @@ impl Chunking {
         Ok(())
     }
 
-    fn chunk_kernel_initramfs(
+    pub(crate) fn process_mapping(&mut self, contentmeta: &ObjectMeta) -> Result<()> {
+        todo!()
+    }
+
+    /// Find the kernel and initramfs, and put them in their own chunk.
+    pub(crate) fn chunk_kernel_initramfs(
         &mut self,
         repo: &ostree::Repo,
         root: &gio::File,

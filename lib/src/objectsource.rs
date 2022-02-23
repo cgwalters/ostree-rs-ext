@@ -19,11 +19,14 @@ pub struct ObjectSourceMeta {
     pub change_frequency: u32,
 }
 
+/// Numeric identifier for content (e.g. package/layer) - does not need to be unique/stable.
+pub type ContentID = u32;
+
 /// Maps from e.g. "bash" or "kernel" to metadata about that content
-pub type ObjectMetaSet = BTreeMap<u32, ObjectSourceMeta>;
+pub type ObjectMetaSet = BTreeMap<ContentID, ObjectSourceMeta>;
 
 /// Maps from an ostree content object digest to the `ContentSet` key.
-pub type ObjectMetaMap = BTreeMap<String, u32>;
+pub type ObjectMetaMap = BTreeMap<String, ContentID>;
 
 /// Grouping of metadata about an object.
 #[derive(Debug, Default, Serialize, Deserialize)]

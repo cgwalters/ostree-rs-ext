@@ -442,7 +442,8 @@ async fn container_export(
         chunked,
         ..Default::default()
     };
-    let pushed = crate::container::encapsulate(repo, rev, &config, Some(opts), imgref).await?;
+    let pushed =
+        crate::container::encapsulate(repo, rev, &config, Some(opts), None, imgref).await?;
     println!("{}", pushed);
     Ok(())
 }
