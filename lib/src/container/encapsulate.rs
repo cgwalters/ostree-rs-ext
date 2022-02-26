@@ -154,7 +154,7 @@ fn build_oci(
 
     let chunking = if let Some(contentmeta) = contentmeta {
         let mut c = crate::chunking::Chunking::new(repo, commit)?;
-        c.process_mapping(contentmeta)?;
+        c.process_mapping(repo, contentmeta)?;
         Some(c)
     } else if opts.chunked {
         // compression = Some(flate2::Compression::none());

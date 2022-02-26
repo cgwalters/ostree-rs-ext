@@ -6,7 +6,7 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use crate::objectsource::ObjectMeta;
+use crate::objectsource::{ContentID, ObjectMeta};
 use crate::objgv::*;
 use anyhow::Result;
 use camino::Utf8PathBuf;
@@ -30,6 +30,14 @@ pub(crate) const MAX_CHUNKS: u32 = 64;
 /// Size in bytes for the minimum size for chunks
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MIN_CHUNK: usize = 10 * 1024;
+
+/// Wrapper for ObjectMeta which computes metadata about size of particular sources
+#[derive(Debug)]
+struct ExtendedObjectMeta<'a> {
+    meta: &'a ObjectMeta,
+
+    sizes: BTreeMap<ContentID, u64>,
+}
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub(crate) struct RcStr(Rc<str>);
@@ -328,7 +336,25 @@ impl Chunking {
         Ok(())
     }
 
-    pub(crate) fn process_mapping(&mut self, contentmeta: &ObjectMeta) -> Result<()> {
+    /// Given metadata about which objects are owned by a particular content source,
+    /// generate chunks that group together those objects.
+    pub(crate) fn process_mapping(
+        &mut self,
+        repo: &ostree::Repo,
+        contentmeta: &ObjectMeta,
+    ) -> Result<()> {
+        let cancellable = gio::NONE_CANCELLABLE;
+        let mut meta = ExtendedObjectMeta {
+            meta: contentmeta,
+            sizes: Default::default(),
+        };
+        for (checksum, &contentid) in contentmeta.map.iter() {
+            let (_, finfo, _) = repo.load_file(checksum, cancellable)?;
+            let finfo = finfo.unwrap();
+            let sz = meta.sizes.entry(contentid).or_default();
+            *sz += finfo.size() as u64;
+        }
+        
         todo!()
     }
 
