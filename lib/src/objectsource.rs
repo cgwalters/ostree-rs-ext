@@ -15,6 +15,8 @@ const VERSION: u32 = 1;
 /// Metadata about a component/package.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ObjectSourceMeta {
+    /// Identifier for this source (e.g. package name-version, git repo)
+    pub name: String,
     /// Unitless relative frequency of changes; zero is lowest.
     pub change_frequency: u32,
 }

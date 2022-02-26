@@ -629,7 +629,7 @@ where
                 let repo = &ostree::Repo::open_at(libc::AT_FDCWD, repo, gio::NONE_CANCELLABLE)?;
                 let mut chunks = crate::chunking::Chunking::new(repo, rev)?;
                 chunks.auto_chunk(repo)?;
-                crate::chunking::print(&chunks);
+                chunks.print();
                 Ok(())
             }
         },

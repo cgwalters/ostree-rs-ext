@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use crate::objectsource::{ContentID, ObjectMeta};
@@ -30,14 +30,6 @@ pub(crate) const MAX_CHUNKS: u32 = 64;
 /// Size in bytes for the minimum size for chunks
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MIN_CHUNK: usize = 10 * 1024;
-
-/// Wrapper for ObjectMeta which computes metadata about size of particular sources
-#[derive(Debug)]
-struct ExtendedObjectMeta<'a> {
-    meta: &'a ObjectMeta,
-
-    sizes: BTreeMap<ContentID, u64>,
-}
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub(crate) struct RcStr(Rc<str>);
@@ -85,7 +77,7 @@ impl Meta {
 
 /// How to split up an ostree commit into "chunks" - designed to map to container image layers.
 #[derive(Debug, Default)]
-pub(crate) struct Chunking {
+pub struct Chunking {
     pub(crate) metadata_size: u64,
     pub(crate) commit: Box<str>,
     pub(crate) meta: Vec<Meta>,
@@ -240,7 +232,7 @@ fn find_kernel_dir(
 
 impl Chunking {
     /// Generate an initial single chunk.
-    pub(crate) fn new(repo: &ostree::Repo, rev: &str) -> Result<Self> {
+    pub fn new(repo: &ostree::Repo, rev: &str) -> Result<Self> {
         // Find the target commit
         let rev = repo.require_rev(rev)?;
 
@@ -338,23 +330,27 @@ impl Chunking {
 
     /// Given metadata about which objects are owned by a particular content source,
     /// generate chunks that group together those objects.
-    pub(crate) fn process_mapping(
+    pub fn process_mapping(
         &mut self,
         repo: &ostree::Repo,
         contentmeta: &ObjectMeta,
     ) -> Result<()> {
+        let remaining = self.remaining();
+        if remaining == 0 {
+            return Ok(());
+        }
+
         let cancellable = gio::NONE_CANCELLABLE;
-        let mut meta = ExtendedObjectMeta {
-            meta: contentmeta,
-            sizes: Default::default(),
-        };
+        let mut sizes = HashMap::<u32, u64>::new();
         for (checksum, &contentid) in contentmeta.map.iter() {
             let (_, finfo, _) = repo.load_file(checksum, cancellable)?;
             let finfo = finfo.unwrap();
-            let sz = meta.sizes.entry(contentid).or_default();
+            let sz = sizes.entry(contentid).or_default();
             *sz += finfo.size() as u64;
         }
-        
+        let mut sizes: Vec<_> = sizes.into_iter().collect();
+        sizes.sort_by(|a, b| a.1.cmp(&b.1));
+
         todo!()
     }
 
@@ -431,24 +427,25 @@ impl Chunking {
         std::mem::swap(&mut self.chunks, &mut r);
         r
     }
-}
 
-pub(crate) fn print(src: &Chunking) {
-    println!("Metadata: {}", glib::format_size(src.metadata_size));
-    for (n, chunk) in src.chunks.iter().enumerate() {
-        let sz = glib::format_size(chunk.size);
+    /// Print information about chunking to standard output.
+    pub fn print(&self) {
+        println!("Metadata: {}", glib::format_size(self.metadata_size));
+        for (n, chunk) in self.chunks.iter().enumerate() {
+            let sz = glib::format_size(chunk.size);
+            println!(
+                "Chunk {}: \"{}\": objects:{} size:{}",
+                n,
+                chunk.name,
+                chunk.content.len(),
+                sz
+            );
+        }
+        let sz = glib::format_size(self.remainder.size);
         println!(
-            "Chunk {}: \"{}\": objects:{} size:{}",
-            n,
-            chunk.name,
-            chunk.content.len(),
+            "Remainder: objects:{} size:{}",
+            self.remainder.content.len(),
             sz
         );
     }
-    let sz = glib::format_size(src.remainder.size);
-    println!(
-        "Remainder: objects:{} size:{}",
-        src.remainder.content.len(),
-        sz
-    );
 }
