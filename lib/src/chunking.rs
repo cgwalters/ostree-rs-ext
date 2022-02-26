@@ -4,6 +4,7 @@
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::convert::TryInto;
 use std::rc::Rc;
 
 use crate::objectsource::{ContentID, ObjectMeta};
@@ -330,11 +331,7 @@ impl Chunking {
 
     /// Given metadata about which objects are owned by a particular content source,
     /// generate chunks that group together those objects.
-    pub fn process_mapping(
-        &mut self,
-        repo: &ostree::Repo,
-        contentmeta: &ObjectMeta,
-    ) -> Result<()> {
+    pub fn process_mapping(&mut self, repo: &ostree::Repo, contentmeta: &ObjectMeta) -> Result<()> {
         let remaining = self.remaining();
         if remaining == 0 {
             return Ok(());
@@ -350,6 +347,14 @@ impl Chunking {
         }
         let mut sizes: Vec<_> = sizes.into_iter().collect();
         sizes.sort_by(|a, b| a.1.cmp(&b.1));
+
+        for (id, sz) in sizes.into_iter().take(remaining.try_into().unwrap()) {
+            let srcmeta = contentmeta
+                .set
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("Missing metadata for {}", id))?;
+            let mut chunk = Chunk::new(srcmeta.name.as_str());
+        }
 
         todo!()
     }
