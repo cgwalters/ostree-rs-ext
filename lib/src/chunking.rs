@@ -339,14 +339,17 @@ impl Chunking {
 
         let cancellable = gio::NONE_CANCELLABLE;
         let mut sizes = HashMap::<u32, u64>::new();
+        // Reverses `contentmeta.map` i.e. contentid -> Vec<checksum>
+        let mut rmap = HashMap::<u32, Vec<&String>>::new();
         for (checksum, &contentid) in contentmeta.map.iter() {
+            rmap.entry(contentid).or_default().push(checksum);
             let (_, finfo, _) = repo.load_file(checksum, cancellable)?;
             let finfo = finfo.unwrap();
             let sz = sizes.entry(contentid).or_default();
             *sz += finfo.size() as u64;
         }
         let mut sizes: Vec<_> = sizes.into_iter().collect();
-        sizes.sort_by(|a, b| a.1.cmp(&b.1));
+        sizes.sort_by(|a, b| b.1.cmp(&a.1));
 
         for (id, sz) in sizes.into_iter().take(remaining.try_into().unwrap()) {
             let srcmeta = contentmeta
@@ -354,9 +357,15 @@ impl Chunking {
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("Missing metadata for {}", id))?;
             let mut chunk = Chunk::new(srcmeta.name.as_str());
+            for &obj in rmap.get(&id).unwrap() {
+                self.remainder.move_obj(&mut chunk, obj.as_str());
+            }
+            if !chunk.content.is_empty() {
+                self.chunks.push(chunk);
+            }
         }
 
-        todo!()
+        Ok(())
     }
 
     /// Find the kernel and initramfs, and put them in their own chunk.
