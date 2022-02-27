@@ -28,6 +28,9 @@ const QUERYATTRS: &str = "standard::name,standard::type";
 // https://github.com/ostreedev/ostree-rs-ext/issues/69
 pub(crate) const MAX_CHUNKS: u32 = 64;
 
+// The percentage of size remaining for which we generate a new chunk
+pub(crate) const CHUNKING_PERCENTAGE: u32 = 10;
+
 /// Size in bytes for the minimum size for chunks
 #[allow(dead_code)]
 pub(crate) const DEFAULT_MIN_CHUNK: usize = 10 * 1024;

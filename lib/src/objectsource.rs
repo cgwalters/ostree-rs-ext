@@ -17,8 +17,10 @@ const VERSION: u32 = 1;
 pub struct ObjectSourceMeta {
     /// Identifier for this source (e.g. package name-version, git repo)
     pub name: String,
-    /// Unitless relative frequency of changes; zero is lowest.
-    pub change_frequency: u32,
+    /// Unitless, relative offset of last change time.
+    /// One suggested way to generate this number is to have it be in units of days
+    /// since the earliest changed item.
+    pub change_time_offset: u32,
 }
 
 /// Numeric identifier for content (e.g. package/layer) - does not need to be unique/stable.
