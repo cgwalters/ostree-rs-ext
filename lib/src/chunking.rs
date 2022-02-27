@@ -341,26 +341,26 @@ impl Chunking {
         }
 
         let cancellable = gio::NONE_CANCELLABLE;
-        let mut sizes = HashMap::<u32, u64>::new();
+        let mut sizes = HashMap::<&str, u64>::new();
         // Reverses `contentmeta.map` i.e. contentid -> Vec<checksum>
-        let mut rmap = HashMap::<u32, Vec<&String>>::new();
-        for (checksum, &contentid) in contentmeta.map.iter() {
-            rmap.entry(contentid).or_default().push(checksum);
+        let mut rmap = HashMap::<ContentID, Vec<&String>>::new();
+        for (checksum, contentid) in contentmeta.map.iter() {
+            rmap.entry(contentid.clone()).or_default().push(checksum);
             let (_, finfo, _) = repo.load_file(checksum, cancellable)?;
             let finfo = finfo.unwrap();
-            let sz = sizes.entry(contentid).or_default();
+            let sz = sizes.entry(contentid.as_str()).or_default();
             *sz += finfo.size() as u64;
         }
         let mut sizes: Vec<_> = sizes.into_iter().collect();
         sizes.sort_by(|a, b| b.1.cmp(&a.1));
 
-        for (id, sz) in sizes.into_iter().take(remaining.try_into().unwrap()) {
+        for (id, _sz) in sizes.into_iter().take(remaining.try_into().unwrap()) {
             let srcmeta = contentmeta
                 .set
-                .get(&id)
+                .get(id)
                 .ok_or_else(|| anyhow::anyhow!("Missing metadata for {}", id))?;
             let mut chunk = Chunk::new(srcmeta.name.as_str());
-            for &obj in rmap.get(&id).unwrap() {
+            for &obj in rmap.get(id).unwrap() {
                 self.remainder.move_obj(&mut chunk, obj.as_str());
             }
             if !chunk.content.is_empty() {

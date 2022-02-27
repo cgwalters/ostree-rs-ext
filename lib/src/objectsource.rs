@@ -15,16 +15,17 @@ const VERSION: u32 = 1;
 /// Metadata about a component/package.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ObjectSourceMeta {
-    /// Identifier for this source (e.g. package name-version, git repo)
+    /// Identifier for this source (e.g. package name-version, git repo).
+    /// Unlike the [`ContentID`], this should be human readable.
     pub name: String,
     /// Unitless, relative offset of last change time.
-    /// One suggested way to generate this number is to have it be in units of days
+    /// One suggested way to generate this number is to have it be in units of hours or days
     /// since the earliest changed item.
     pub change_time_offset: u32,
 }
 
-/// Numeric identifier for content (e.g. package/layer) - does not need to be unique/stable.
-pub type ContentID = u32;
+/// Identifier for content (e.g. package/layer).  Not necessarily human readable.
+pub type ContentID = String;
 
 /// Maps from e.g. "bash" or "kernel" to metadata about that content
 pub type ObjectMetaSet = BTreeMap<ContentID, ObjectSourceMeta>;
