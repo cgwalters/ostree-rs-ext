@@ -556,7 +556,12 @@ pub(crate) fn export_final_chunk<W: std::io::Write>(
     out: &mut tar::Builder<W>,
 ) -> Result<()> {
     let cancellable = gio::NONE_CANCELLABLE;
-    let writer = &mut OstreeTarWriter::new(repo, out, ExportOptions::default());
+    // For chunking, we default to format version 1
+    let options = ExportOptions {
+        format_version: 1,
+        ..Default::default()
+    };
+    let writer = &mut OstreeTarWriter::new(repo, out, options);
     writer.write_repo_structure()?;
 
     let (commit_v, _) = repo.load_commit(&chunking.commit)?;
