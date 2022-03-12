@@ -323,7 +323,7 @@ impl Chunking {
             .unwrap();
 
         // TODO: Compute bin packing in a better way
-        let packing = pack(sizes, self.remaining());
+        let packing = basic_packing(sizes, NonZeroU32::new(self.max).unwrap());
 
         for bin in packing.into_iter() {
             let first = bin[0];
@@ -402,7 +402,6 @@ fn components_size(components: &[&ObjectSourceMetaSized]) -> u64 {
     components.iter().map(|k| k.size).sum()
 }
 
-#[cfg(test)]
 /// Compute the total size of a packing
 fn packing_size(packing: &[ChunkedComponents]) -> u64 {
     packing.iter().map(|v| components_size(&v)).sum()
@@ -418,18 +417,20 @@ fn sort_packing(packing: &mut [ChunkedComponents]) {
 
 /// Given a set of components with size metadata (e.g. boxes of a certain size)
 /// and a number of bins (possible container layers) to use, determine which components
-/// go in which bin.
-fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<ChunkedComponents> {
+/// go in which bin.  This algorithm is pretty simple:
+///
+/// - order by size
+/// - If we have fewer components than bins, we're done
+/// - Take the "tail" (all components past maximum), and group by source package
+/// - If we have fewer components than bins, we're done
+/// - Take the whole tail and group them toether (this is the overly simplistic part)
+fn basic_packing(components: &[ObjectSourceMetaSized], bins: NonZeroU32) -> Vec<ChunkedComponents> {
     // let total_size: u64 = components.iter().map(|v| v.size).sum();
     // let avg_size: u64 = total_size / components.len() as u64;
     let mut r = Vec::new();
-    // Handle this pathological case now
-    if bins == 0 {
-        return r;
-    }
     // And handle the easy case of enough bins for all components
     // TODO: Possibly try to split off large files?
-    if components.len() <= bins as usize {
+    if components.len() <= bins.get() as usize {
         r.extend(components.iter().map(|v| vec![v]));
         return r;
     }
@@ -438,7 +439,7 @@ fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<ChunkedComponent
     // Iterate over the component tail, folding by source id
     let mut by_src = HashMap::<_, Vec<&ObjectSourceMetaSized>>::new();
     // Take the tail off components, then build up mapping from srcid -> Vec<component>
-    for component in components.split_off(bins as usize) {
+    for component in components.split_off(bins.get() as usize) {
         by_src
             .entry(&component.meta.srcid)
             .or_default()
@@ -452,11 +453,11 @@ fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<ChunkedComponent
     sort_packing(&mut r);
     // It's possible that merging components gave us enough space; if so
     // we're done!
-    if r.len() <= bins as usize {
+    if r.len() <= bins.get() as usize {
         return r;
     }
 
-    let last = (bins - 1) as usize;
+    let last = (bins.get().checked_sub(1).unwrap()) as usize;
     // The "tail" is components past our maximum.  For now, we simply group all of that together as a single unit.
     if let Some(tail) = r.drain(last..).reduce(|mut a, b| {
         a.extend(b.into_iter());
@@ -465,8 +466,55 @@ fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<ChunkedComponent
         r.push(tail);
     }
 
-    assert!(r.len() <= bins as usize);
+    assert!(r.len() <= bins.get() as usize);
     r
+}
+
+fn take_big_mid_small<'a>(components: &mut ChunkedComponents<'a>) -> ChunkedComponents<'a> {
+    let mid = components.len() / 2;
+    let mut r = Vec::new();
+    r.push(components.remove(mid));
+    if let Some(v) = components.pop() {
+        r.push(v)
+    }
+    if components.len() > 0 {
+        r.push(components.remove(0));
+    }
+    r
+}
+
+/// Given a basic packing, try to optimize the "tail" by
+/// "folding" it back up.
+fn tail_fold(components: &mut Vec<ChunkedComponents>) {
+    match components.len() {
+        0 => unreachable!(),
+        // Nothing to do if there's only one layer
+        1 => {
+            return;
+        }
+        _ => {}
+    };
+    let mut last = components.len().checked_sub(1).unwrap();
+    let last_size = components_size(&components[last]);
+    let mut tail = components.pop().unwrap();
+    let mut tail_size = components_size(&tail);
+
+    while tail.len() > components[last].len() && tail_size > last_size {
+        let chunk = take_big_mid_small(&mut tail);
+        tail_size = components_size(&tail);
+        components[last].extend(chunk);
+        let last_size = components_size(&components[last]);
+        if last > 0 {
+            let prevlast = last.checked_sub(1).unwrap();
+            let prevlast_size = components_size(&components[prevlast]);
+            if last_size > prevlast_size {
+                last = prevlast;
+            }
+        }
+    }
+    if tail.len() > 0 {
+        components.push(tail);
+    }
 }
 
 // Some aborted bits to try improved tail packing
@@ -515,8 +563,8 @@ mod test {
     #[test]
     fn test_packing_basics() -> Result<()> {
         // null cases
-        for v in [0, 1, 7] {
-            assert_eq!(pack(&[], v).len(), 0);
+        for v in [1u32, 7].map(|v| NonZeroU32::new(v).unwrap()) {
+            assert_eq!(basic_packing(&[], v).len(), 0);
         }
         Ok(())
     }
@@ -527,7 +575,7 @@ mod test {
             serde_json::from_reader(flate2::read::GzDecoder::new(FCOS_CONTENTMETA))?;
         let total_size = contentmeta.iter().map(|v| v.size).sum::<u64>();
 
-        let packing = pack(&contentmeta, MAX_CHUNKS);
+        let packing = basic_packing(&contentmeta, NonZeroU32::new(MAX_CHUNKS).unwrap());
         assert!(!contentmeta.is_empty());
         // We should fit into the assigned chunk size
         assert_eq!(packing.len() as u32, MAX_CHUNKS);
