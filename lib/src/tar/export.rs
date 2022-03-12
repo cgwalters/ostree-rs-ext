@@ -557,6 +557,7 @@ pub(crate) fn export_final_chunk<W: std::io::Write>(
 ) -> Result<()> {
     let cancellable = gio::NONE_CANCELLABLE;
     // For chunking, we default to format version 1
+    #[allow(clippy::needless_update)]
     let options = ExportOptions {
         format_version: 1,
         ..Default::default()
