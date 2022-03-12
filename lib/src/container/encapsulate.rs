@@ -13,6 +13,7 @@ use oci_spec::image as oci_image;
 use ostree::gio;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::rc::Rc;
 use tracing::{instrument, Level};
@@ -152,7 +153,7 @@ fn build_oci(
     let mut manifest = ocidir::new_empty_manifest().build().unwrap();
 
     let chunking = contentmeta
-        .map(|meta| crate::chunking::Chunking::from_mapping(repo, commit, meta))
+        .map(|meta| crate::chunking::Chunking::from_mapping(repo, commit, meta, opts.max_layers))
         .transpose()?;
 
     if let Some(version) =
@@ -303,6 +304,8 @@ pub struct ExportOpts {
     pub compress: bool,
     /// A set of commit metadata keys to copy as image labels.
     pub copy_meta_keys: Vec<String>,
+    /// Maximum number of layers to use
+    pub max_layers: Option<NonZeroU32>,
 }
 
 /// Given an OSTree repository and ref, generate a container image.

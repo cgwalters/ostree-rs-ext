@@ -6,6 +6,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::fmt::Write;
+use std::num::NonZeroU32;
 use std::rc::Rc;
 
 use crate::objectsource::{ContentID, ObjectMeta, ObjectMetaMap, ObjectSourceMeta};
@@ -111,6 +112,8 @@ pub struct Chunking {
     pub(crate) meta: Vec<Meta>,
     pub(crate) remainder: Chunk,
     pub(crate) chunks: Vec<Chunk>,
+
+    pub(crate) max: u32,
 
     processed_mapping: bool,
     /// Number of components (e.g. packages) provided originally
@@ -269,19 +272,32 @@ impl Chunking {
     }
 
     /// Generate a chunking from an object mapping.
-    pub fn from_mapping(repo: &ostree::Repo, rev: &str, meta: ObjectMetaSized) -> Result<Self> {
+    pub fn from_mapping(
+        repo: &ostree::Repo,
+        rev: &str,
+        meta: ObjectMetaSized,
+        max_layers: Option<NonZeroU32>,
+    ) -> Result<Self> {
         let mut r = Self::new(repo, rev)?;
-        r.process_mapping(meta)?;
+        r.process_mapping(meta, max_layers)?;
         Ok(r)
     }
 
     fn remaining(&self) -> u32 {
-        MAX_CHUNKS.saturating_sub(self.chunks.len() as u32)
+        self.max.saturating_sub(self.chunks.len() as u32)
     }
 
     /// Given metadata about which objects are owned by a particular content source,
     /// generate chunks that group together those objects.
-    pub fn process_mapping(&mut self, meta: ObjectMetaSized) -> Result<()> {
+    pub fn process_mapping(
+        &mut self,
+        meta: ObjectMetaSized,
+        max_layers: Option<NonZeroU32>,
+    ) -> Result<()> {
+        self.max = max_layers
+            .unwrap_or(NonZeroU32::new(MAX_CHUNKS).unwrap())
+            .get();
+
         let sizes = &meta.sizes;
         // It doesn't make sense to handle multiple mappings
         assert!(!self.processed_mapping);
@@ -380,10 +396,22 @@ impl Chunking {
     }
 }
 
-fn sort_packing(packing: &mut [Vec<&ObjectSourceMetaSized>]) {
+type ChunkedComponents<'a> = Vec<&'a ObjectSourceMetaSized>;
+
+fn components_size(components: &[&ObjectSourceMetaSized]) -> u64 {
+    components.iter().map(|k| k.size).sum()
+}
+
+#[cfg(test)]
+/// Compute the total size of a packing
+fn packing_size(packing: &[ChunkedComponents]) -> u64 {
+    packing.iter().map(|v| components_size(&v)).sum()
+}
+
+fn sort_packing(packing: &mut [ChunkedComponents]) {
     packing.sort_by(|a, b| {
-        let a: u64 = a.iter().map(|k| k.size).sum();
-        let b: u64 = b.iter().map(|k| k.size).sum();
+        let a: u64 = components_size(a);
+        let b: u64 = components_size(b);
         b.cmp(&a)
     });
 }
@@ -391,7 +419,7 @@ fn sort_packing(packing: &mut [Vec<&ObjectSourceMetaSized>]) {
 /// Given a set of components with size metadata (e.g. boxes of a certain size)
 /// and a number of bins (possible container layers) to use, determine which components
 /// go in which bin.
-fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<Vec<&ObjectSourceMetaSized>> {
+fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<ChunkedComponents> {
     // let total_size: u64 = components.iter().map(|v| v.size).sum();
     // let avg_size: u64 = total_size / components.len() as u64;
     let mut r = Vec::new();
@@ -428,19 +456,55 @@ fn pack(components: &[ObjectSourceMetaSized], bins: u32) -> Vec<Vec<&ObjectSourc
         return r;
     }
 
-    // For now, just stick everything in the tail together
     let last = (bins - 1) as usize;
-    let tail = r.drain(last..).reduce(|mut a, b| {
+    // The "tail" is components past our maximum.  For now, we simply group all of that together as a single unit.
+    if let Some(tail) = r.drain(last..).reduce(|mut a, b| {
         a.extend(b.into_iter());
         a
-    });
-    if let Some(tail) = tail {
-        r.push(tail)
+    }) {
+        r.push(tail);
     }
 
     assert!(r.len() <= bins as usize);
     r
 }
+
+// Some aborted bits to try improved tail packing
+// let mut tail = r.drain(last..).collect::<Vec<_>>();
+// let tail_size = packing_size(&tail);
+// // Find the component that is bigger than the entire tail
+// let tail_packing_start = r
+//     .iter()
+//     .position(|v| components_size(&v) < tail_size)
+//     .unwrap_or(0);
+
+// let mut chunked_tail = Vec::new();
+// let mut current: Option<ChunkedComponents> = None;
+// for v in tail.into_iter().reverse() {
+//     let vsz = components_size(&v);
+//     match current.as_mut() {
+//         Some(current) => {
+//             let current_size = components_size(&current);
+//             if current_size + vsz < tail_size {
+
+//             }
+//         }
+//     }
+// }
+// dbg!(tail_size, tail.len(), tail_packing_start);
+// loop {
+//     if tail_size < last_size {
+//         break
+//     }
+//     // Fold two components of tail together
+// }
+// last.reduce(|mut a, b| {
+//     a.extend(b.into_iter());
+//     a
+// });
+// if let Some(tail) = tail {
+//     r.push(tail)
+// }
 
 #[cfg(test)]
 mod test {
@@ -449,12 +513,16 @@ mod test {
     const FCOS_CONTENTMETA: &[u8] = include_bytes!("fixtures/fedora-coreos-contentmeta.json.gz");
 
     #[test]
-    fn test_packing() -> Result<()> {
+    fn test_packing_basics() -> Result<()> {
         // null cases
         for v in [0, 1, 7] {
             assert_eq!(pack(&[], v).len(), 0);
         }
+        Ok(())
+    }
 
+    #[test]
+    fn test_packing_fcos() -> Result<()> {
         let contentmeta: Vec<ObjectSourceMetaSized> =
             serde_json::from_reader(flate2::read::GzDecoder::new(FCOS_CONTENTMETA))?;
         let total_size = contentmeta.iter().map(|v| v.size).sum::<u64>();
@@ -464,10 +532,7 @@ mod test {
         // We should fit into the assigned chunk size
         assert_eq!(packing.len() as u32, MAX_CHUNKS);
         // And verify that the sizes match
-        let packed_total_size = packing
-            .iter()
-            .map(|v| v.iter().map(|v| v.size).sum::<u64>())
-            .sum::<u64>();
+        let packed_total_size = packing_size(&packing);
         assert_eq!(total_size, packed_total_size);
         Ok(())
     }
