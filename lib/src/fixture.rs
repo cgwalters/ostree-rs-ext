@@ -3,7 +3,10 @@
 #![allow(missing_docs)]
 
 use crate::chunking::ObjectMetaSized;
-use crate::container::{Config, ExportOpts, ImageReference, Transport};
+use crate::container::store::LayeredImageState;
+use crate::container::{
+    store, Config, ExportOpts, ImageReference, OstreeImageReference, Transport,
+};
 use crate::objectsource::{ObjectMeta, ObjectSourceMeta};
 use crate::prelude::*;
 use crate::{gio, glib};
@@ -658,6 +661,27 @@ impl Fixture {
         crate::tar::export_commit(&self.srcrepo, rev.as_str(), &mut outf, Some(options))?;
         outf.flush()?;
         Ok(path.into())
+    }
+
+    /// Convert the current ref into an imported container image in the *source* repo.
+    #[context("Committing as container")]
+    pub async fn commit_as_container(&self) -> Result<(ImageReference, Box<LayeredImageState>)> {
+        let (tmpimg, tmpdigest) = self.export_container().await?;
+        let tmpimg_ostree = OstreeImageReference {
+            sigverify: crate::container::SignatureSource::ContainerPolicyAllowInsecure,
+            imgref: tmpimg.clone(),
+        };
+        let mut imp =
+            store::ImageImporter::new(self.srcrepo(), &tmpimg_ostree, Default::default()).await?;
+        assert!(store::query_image(self.srcrepo(), &tmpimg)
+            .unwrap()
+            .is_none());
+        let prep = match imp.prepare().await.context("Init prep derived")? {
+            store::PrepareResult::AlreadyPresent(_) => panic!("should not be already imported"),
+            store::PrepareResult::Ready(r) => r,
+        };
+        let r = imp.import(prep).await?;
+        Ok((tmpimg, r))
     }
 
     /// Export the current ref as a container image.

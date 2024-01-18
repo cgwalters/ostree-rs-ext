@@ -12,8 +12,11 @@ use crate::sysroot::SysrootLock;
 use crate::utils::ResultExt;
 use anyhow::{anyhow, Context};
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std_ext::cap_std;
 use cap_std_ext::cap_std::fs::{Dir, MetadataExt};
+use cap_std_ext::cmdext::CapStdExtCommandExt;
 use containers_image_proxy::{ImageProxy, OpenedImage};
+use flate2::Compression;
 use fn_error_context::context;
 use futures_util::TryFutureExt;
 use oci_spec::image::{self as oci_image, Descriptor, History, ImageConfiguration, ImageManifest};
@@ -1207,6 +1210,106 @@ pub async fn copy(
     )?;
 
     Ok(())
+}
+
+/// Export an imported container image to a target OCI directory.
+#[context("Copying image")]
+pub fn export_to_oci(
+    repo: &ostree::Repo,
+    imgref: &ImageReference,
+    dest_oci: &Dir,
+    tag: Option<&str>,
+    compression_fast: bool,
+) -> Result<Descriptor> {
+    let srcinfo = query_image(repo, imgref)?.ok_or_else(|| anyhow!("No such image"))?;
+    // Unfortunately, today we lose data when deserializing an image,
+    let mut new_manifest = srcinfo.manifest.clone();
+    new_manifest.layers_mut().clear();
+    let mut new_config = srcinfo.configuration.clone();
+    new_config.history_mut().clear();
+
+    let dest_oci = crate::ocidir::OciDir::ensure(&dest_oci)?;
+    let compression = compression_fast.then_some(Compression::fast());
+
+    // Create a task to copy each layer, plus the final ref
+    let layer_refs = srcinfo.manifest.layers().iter().map(ref_for_layer);
+    for (i, layer_ref) in layer_refs.enumerate() {
+        let layer_ref = layer_ref?;
+        let mut target_blob = dest_oci.create_raw_layer(compression)?;
+        // Sadly the libarchive stuff isn't exposed via Rust due to type unsafety,
+        // so we'll just fork off the CLI.
+        let repo_dfd = repo.dfd_borrow();
+        let repo_dir = cap_std_ext::cap_std::fs::Dir::reopen_dir(&repo_dfd)?;
+        let mut subproc = std::process::Command::new("ostree")
+            .args(["--repo=", ".", "export", layer_ref.as_str()])
+            .stdout(std::process::Stdio::piped())
+            .cwd_dir(repo_dir)
+            .spawn()?;
+        // SAFETY: we piped just above
+        let mut stdout = subproc.stdout.take().unwrap();
+        std::io::copy(&mut stdout, &mut target_blob).context("Creating blob")?;
+        let layer = target_blob.complete()?;
+        let previous_annotations = srcinfo
+            .manifest
+            .layers()
+            .get(i)
+            .and_then(|l| l.annotations().as_ref())
+            .cloned();
+        let previous_description = srcinfo
+            .configuration
+            .history()
+            .get(i)
+            .and_then(|h| h.comment().as_deref())
+            .unwrap_or_default();
+        dest_oci.push_layer(
+            &mut new_manifest,
+            &mut new_config,
+            layer,
+            previous_description,
+            previous_annotations,
+        )
+    }
+
+    let new_config = dest_oci.write_config(new_config)?;
+    new_manifest.set_config(new_config);
+
+    dest_oci.insert_manifest(new_manifest, tag, oci_image::Platform::default())
+}
+
+/// Given an input container image,
+pub async fn finalize_export(
+    repo: &ostree::Repo,
+    src_imgref: &ImageReference,
+    dest_imgref: &ImageReference,
+    proxyopts: ImageProxyConfig,
+    compression_fast: bool,
+) -> Result<String> {
+    let target_oci = dest_imgref.transport == Transport::OciDir;
+    let tempdir = if !target_oci {
+        let vartmp = cap_std::fs::Dir::open_ambient_dir("/var/tmp", cap_std::ambient_authority())?;
+        let td = cap_std_ext::cap_tempfile::TempDir::new_in(&vartmp)?;
+        export_to_oci(repo, src_imgref, &td, None, compression_fast)?;
+        td
+    } else {
+        let (path, tag) = parse_oci_path_and_tag(dest_imgref.name.as_str());
+        tracing::debug!("using OCI path={path} tag={tag:?}");
+        let path = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+        let descriptor = export_to_oci(repo, src_imgref, &path, tag, false)?;
+        return Ok(descriptor.digest().clone());
+    };
+    // Pass the temporary oci directory as the current working directory for the skopeo process
+    let target_fd = 3i32;
+    let tempoci = ImageReference {
+        transport: Transport::OciDir,
+        name: format!("/proc/self/fd/{target_fd}"),
+    };
+    skopeo::copy(
+        &tempoci,
+        dest_imgref,
+        proxyopts.authfile.as_deref(),
+        Some((std::sync::Arc::new(tempdir.try_clone()?.into()), target_fd)),
+    )
+    .await
 }
 
 /// Iterate over deployment commits, returning the manifests from

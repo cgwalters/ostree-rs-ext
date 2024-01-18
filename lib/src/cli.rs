@@ -182,7 +182,7 @@ pub(crate) enum ContainerOpts {
 }
 
 /// Options for container image fetching.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 pub(crate) struct ContainerProxyOpts {
     #[clap(long)]
     /// Do not use default authentication files.
@@ -275,6 +275,34 @@ pub(crate) enum ContainerImageOpts {
         /// Image reference, e.g. ostree-remote-image:someremote:registry:quay.io/exampleos/exampleos:latest
         #[clap(value_parser = parse_imgref)]
         imgref: OstreeImageReference,
+    },
+
+    /// Given an input container image, perform "pre-optimization" such as SELinux
+    /// labeling.
+    FinalizeExport {
+        /// Path to an OSTree repository; if not provided, a temporary one will
+        /// be auto-synthesized.
+        #[clap(long, value_parser)]
+        repo: Option<Utf8PathBuf>,
+
+        /// Source image reference, e.g. registry:quay.io/exampleos/exampleos:latest
+        #[clap(value_parser = parse_base_imgref)]
+        src_imgref: ImageReference,
+
+        /// Destination image reference, e.g. registry:quay.io/exampleos/exampleos:latest
+        #[clap(value_parser = parse_base_imgref)]
+        dest_imgref: ImageReference,
+
+        #[clap(flatten)]
+        proxyopts: ContainerProxyOpts,
+
+        /// Do not output progress information
+        #[clap(long)]
+        quiet: bool,
+
+        /// Compress at the fastest level (e.g. gzip level 1)
+        #[clap(long)]
+        compression_fast: bool,
     },
 
     /// Replace the detached metadata (e.g. to add a signature)
@@ -710,6 +738,44 @@ async fn container_info(imgref: &OstreeImageReference) -> Result<()> {
     Ok(())
 }
 
+async fn container_image_finalize_export(
+    repo: Option<&Utf8Path>,
+    src_imgref: &ImageReference,
+    dest_imgref: &ImageReference,
+    proxyopts: ContainerProxyOpts,
+    quiet: bool,
+    compression_fast: bool,
+) -> Result<()> {
+    let (tmpdir, repo) = if let Some(repo) = repo {
+        let repo = ostree::Repo::open_at(libc::AT_FDCWD, repo.as_str(), gio::Cancellable::NONE)
+            .with_context(|| format!("Opening {repo}"))?;
+        (None, repo)
+    } else {
+        let tmpdir = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+        let tmp_repo =
+            ostree::Repo::create_at_dir(tmpdir.as_fd(), ".", ostree::RepoMode::BareUser, None)
+                .context("Creating temp ostree repo")?;
+        (Some(tmpdir), tmp_repo)
+    };
+    let src_imgref_ostree = OstreeImageReference {
+        sigverify: ostree_container::SignatureSource::ContainerPolicyAllowInsecure,
+        imgref: src_imgref.clone(),
+    };
+    // Reuse the CLI pulling flow
+    container_store(&repo, &src_imgref_ostree, proxyopts.clone(), quiet, None).await?;
+    let digest = ostree_container::store::finalize_export(
+        &repo,
+        src_imgref,
+        &dest_imgref,
+        proxyopts.into(),
+        compression_fast,
+    )
+    .await?;
+    println!("Exported: {digest}");
+    drop(tmpdir);
+    Ok(())
+}
+
 /// Write a layered container image into an OSTree commit.
 async fn container_store(
     repo: &ostree::Repo,
@@ -968,6 +1034,24 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                 } => {
                     let repo = parse_repo(&repo)?;
                     container_store(&repo, &imgref, proxyopts, quiet, check).await
+                }
+                ContainerImageOpts::FinalizeExport {
+                    repo,
+                    src_imgref,
+                    dest_imgref,
+                    proxyopts,
+                    quiet,
+                    compression_fast,
+                } => {
+                    container_image_finalize_export(
+                        repo.as_deref(),
+                        &src_imgref,
+                        &dest_imgref,
+                        proxyopts,
+                        quiet,
+                        compression_fast,
+                    )
+                    .await
                 }
                 ContainerImageOpts::History { repo, imgref } => {
                     let repo = parse_repo(&repo)?;

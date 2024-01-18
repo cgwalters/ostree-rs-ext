@@ -359,6 +359,11 @@ impl OciDir {
         self.read_manifest_and_descriptor().map(|r| r.0)
     }
 
+    /// Parse the manifest for the given descriptor.
+    pub fn read_manifest_from_descriptor(&self, desc: &Descriptor) -> Result<oci_image::ImageManifest> {
+        self.read_json_blob(desc)
+    }
+
     /// Find the manifest with the provided tag
     pub fn find_manifest_with_tag(&self, tag: &str) -> Result<Option<oci_image::ImageManifest>> {
         let f = self

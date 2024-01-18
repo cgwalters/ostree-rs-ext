@@ -602,6 +602,21 @@ async fn impl_test_container_import_export(chunked: bool) -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_export_as_container() -> Result<()> {
+    let fixture = Fixture::new_v1()?;
+    let sh = fixture.new_shell()?;
+    let (imgref, img) = fixture.commit_as_container().await?;
+
+    let dest = ImageReference {
+        transport: Transport::OciDir,
+        name: fixture.path.join("exported.ocidir").to_string(),
+    };
+    let exported = store::export(fixture.srcrepo(), &imgref, &dest, None, false).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_unencapsulate_unbootable() -> Result<()> {
     let fixture = {
         let mut fixture = Fixture::new_base()?;
