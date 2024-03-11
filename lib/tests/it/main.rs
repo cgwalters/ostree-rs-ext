@@ -1261,6 +1261,37 @@ async fn test_container_write_derive() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_zstd() -> Result<()> {
+    let fixture = Fixture::new_v1()?;
+    let sh = fixture.new_shell()?;
+    let base_oci_path = &fixture.path.join("exampleos.oci");
+    let _digest = ostree_ext::container::encapsulate(
+        fixture.srcrepo(),
+        fixture.testref(),
+        &Config {
+            cmd: Some(vec!["/bin/bash".to_string()]),
+            ..Default::default()
+        },
+        None,
+        &ImageReference {
+            transport: Transport::OciDir,
+            name: base_oci_path.to_string(),
+        },
+    )
+    .await
+    .context("exporting")?;
+    assert!(base_oci_path.exists());
+
+    {
+        let src = format!("oci:{base_oci_path}");
+    Command::new("skopeo")
+        .args(["copy", "--dest-compress-format", "zstd:chunked"])
+        .args([src.as_str(), ])
+
+
+}
+
 /// Test for https://github.com/ostreedev/ostree-rs-ext/issues/405
 /// We need to handle the case of modified hardlinks into /sysroot
 #[tokio::test]
