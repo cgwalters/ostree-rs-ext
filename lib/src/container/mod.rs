@@ -470,6 +470,7 @@ pub fn version_for_config(config: &oci_spec::image::ImageConfiguration) -> Optio
 }
 
 pub mod deploy;
+pub mod dataimage;
 mod encapsulate;
 pub use encapsulate::*;
 mod unencapsulate;
