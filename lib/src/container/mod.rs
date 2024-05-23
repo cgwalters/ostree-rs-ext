@@ -26,7 +26,7 @@
 //! for this is [planned but not implemented](https://github.com/ostreedev/ostree-rs-ext/issues/12).
 
 use anyhow::anyhow;
-use containers_image_proxy::oci_spec;
+use containers_image_proxy::{oci_spec, ImageProxy};
 use ostree::glib;
 use serde::Serialize;
 
