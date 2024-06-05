@@ -56,6 +56,23 @@ ostree-ext-cli container image prune-images --sysroot "${sysroot}"
 ostree-ext-cli container image list --repo "${sysroot}/ostree/repo" > out.txt
 test $(stat -c '%s' out.txt) = 0
 
+if test -n "${TEST_AUTH_FILE}"; then
+    # REGISTRY must also be set
+    test -n "${REGISTRY}"
+    mkdir -p /etc/ostree
+    auth_image=$REGISTRY/testimage
+    skopeo copy --authfile ${TEST_AUTH_FILE} docker://${image} docker://$REGISTRY/testimage
+    if skopeo inspect -n --no-creds docker://$REGISTRY/testimage >/dev/null; then 
+        echo "should have failed to access image"; exit 1
+    fi
+    auth_imgref=ostree-unverified-registry:${image}
+    if ostree-ext-cli container image pull --repo "${sysroot}/repo" "${auth_imgref}"; then
+        echo "should have failed to deploy authenticated image"; exit 1
+    fi
+    cp -p $TEST_AUTH_FILE /etc/ostree/auth.json
+    ostree-ext-cli container image pull --repo "${sysroot}/repo" "${auth_imgref}"
+fi
+
 for img in "${image}"; do
     ostree-ext-cli container image deploy --sysroot "${sysroot}" \
         --stateroot "${stateroot}" --imgref ostree-unverified-registry:"${img}"

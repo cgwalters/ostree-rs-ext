@@ -5,6 +5,7 @@ name: Rust
 
 permissions:
   actions: read
+  packages: write
 
 on:
   push:
@@ -14,6 +15,7 @@ on:
   workflow_dispatch: {}
 
 env:
+  REGISTRY: ghcr.io
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -133,7 +135,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     container:
-      image: quay.io/fedora/fedora-coreos:testing-devel
+      image: quay.io/fedora/fedora-bootc:40
       options: "--privileged --pid=host -v /var/tmp:/var/tmp -v /run/dbus:/run/dbus -v /run/systemd:/run/systemd -v /:/run/host"
     steps:
       - name: Checkout repository
@@ -144,8 +146,10 @@ jobs:
           name: ostree-ext-cli
       - name: Install
         run: install ostree-ext-cli /usr/bin && rm -v ostree-ext-cli
+      - name: login
+        run: podman login --authfile=auth.json --username ${{ github.actor }} --password ${{ secrets.GITHUB_TOKEN }} ${{ env.REGISTRY }}
       - name: Integration tests
-        run: ./ci/priv-integration.sh
+        run: env TEST_AUTH_FILE=$(pwd)/auth.json ./ci/priv-integration.sh 
   container-build:
     name: "Container build"
     needs: build
