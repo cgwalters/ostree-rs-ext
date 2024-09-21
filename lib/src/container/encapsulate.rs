@@ -15,6 +15,7 @@ use flate2::Compression;
 use fn_error_context::context;
 use gio::glib;
 use oci_spec::image as oci_image;
+use ocidir::oci_spec::image::Arch;
 use ocidir::{Layer, OciDir};
 use ostree::gio;
 use std::borrow::Cow;
@@ -158,6 +159,21 @@ pub(crate) fn export_chunked(
     Ok(())
 }
 
+fn linux_arch_to_goarch(a: &str) -> Arch {
+    // Copied from 
+    // It seems like the Rust ones are the same GNU/Linux...except for `powerpc64` and not `ppc64le`?
+    // This list just contains exceptions, everything else is passed through literally.
+    // See also https://github.com/containerd/containerd/blob/140ecc9247386d3be21616fe285021c081f4ea08/platforms/database.go
+    let goarch = match a {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "powerpc64" if cfg!(target_endian = "big") => "ppc64",
+        "powerpc64" if cfg!(target_endian = "little") => "ppc64le",
+        o => o,
+    };
+    Arch::from(goarch)
+}
+
 /// Generate an OCI image from a given ostree root
 #[context("Building oci")]
 #[allow(clippy::too_many_arguments)]
@@ -177,6 +193,7 @@ fn build_oci(
         0,
     )
     .unwrap();
+
     let commit_subject = commit_v.child_value(3);
     let commit_subject = commit_subject.str().ok_or_else(|| {
         anyhow::anyhow!(
@@ -186,6 +203,11 @@ fn build_oci(
     })?;
     let commit_meta = &commit_v.child_value(0);
     let commit_meta = glib::VariantDict::new(Some(commit_meta));
+    let mut ostree_arch = commit_meta.lookup::<String>(&ostree::COMMIT_META_KEY_ARCHITECTURE)?;
+    if ostree_arch.is_none() {
+        // Sadly we never standardized this in
+        commit_meta.lookup::<String>("coreos-assembler.basearch")?;
+    };
 
     let mut ctrcfg = opts.container_config.clone().unwrap_or_default();
     let mut imgcfg = oci_image::ImageConfiguration::default();
@@ -275,7 +297,10 @@ fn build_oci(
     let ctrcfg = writer.write_config(imgcfg)?;
     manifest.set_config(ctrcfg);
     manifest.set_annotations(Some(labels));
-    let platform = oci_image::Platform::default();
+    let mut platform = oci_image::Platform::default();
+    if let Some(arch) = ostree_arch.as_ref() {
+        platform.set_architecture(arch.clone());
+    }
     if let Some(tag) = tag {
         writer.insert_manifest(manifest, Some(tag), platform)?;
     } else {
